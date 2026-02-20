@@ -124,37 +124,72 @@ def parse_invoice(text):
     )
 
     # ── Tedarikçi ──────────────────────────────────────────────────────────────
-    # pdfminer ham metinde ilk anlamlı satır tedarikçi
-    skip_rx = re.compile(r'^(fatura|invoice|no|tarih|date|sayfa|page|e-?fatura|tel|vergi|vkn|tckn|mersis|epdk|\d{1,4}|tr\d)$', re.I)
-    supplier = None
-    # Önce satır satır dene (CTG, Dicle gibi)
-    for line in text.split('\n'):
-        cl = line.strip()
-        if len(cl) >= 4 and not skip_rx.match(cl) and not re.match(r'^\d+$', cl) and not re.match(r'^[:\-\.\s]+$', cl):
-            # Satır meta bilgi değil mi kontrol et
-            if not re.match(r'^(Özelleştirme|Senaryo|ETTN|Sicil|İşlem)', cl):
-                supplier = cl[:70]
-                break
+    def _parse_supplier(text):
+        all_lines = []
+        for segment in text.split('\n'):
+            for sub in segment.split('\xa0'):
+                sub = sub.strip()
+                if sub and len(sub) > 1:
+                    all_lines.append(sub)
 
-    # Satırdan bulunamazsa (Otojet gibi tek uzun satır) — firma adı pattern ile bul
-    if not supplier:
-        norm = re.sub(r'\xa0', ' ', text)
-        # ETTN/UUID ve hex kodlarını temizle ki "0EC4FOTOJET" → "OTOJET" yakalansın
-        norm_clean = re.sub(r'[0-9A-Fa-f]{8}-[0-9A-Fa-f-]{27}', ' ', norm)
-        norm_clean = re.sub(r'[0-9A-Fa-f]{4,}(?=[A-ZÇĞİÖŞÜ])', ' ', norm_clean)
-        m_sup = re.search(r'(?<![A-Za-z])([A-ZÇĞİÖŞÜ]{2,}(?:\s+[A-ZÇĞİÖŞÜa-zçğışöşü\.]+){1,6}\s*(?:SİRKETİ|SİRKETI|SIRKETI|A\.Ş|A\.S|Ltd|LTD))', norm_clean)
-        if m_sup:
-            s = re.sub(r'\s+', ' ', m_sup.group(1)).strip()
-            s = re.sub(r'([A-Z])ANONİM', r'\1 ANONİM', s)
-            s = re.sub(r'([A-Z])ANONIM', r'\1 ANONIM', s)
-            s = re.sub(r'([A-Z])SİRKETİ', r'\1 SİRKETİ', s)
-            s = re.sub(r'([A-Z])SIRKETI', r'\1 SİRKETİ', s)
-            supplier = re.sub(r'\s+', ' ', s).strip()[:80]
+        skip_rx = re.compile(
+            r'^(sayin|sayın|fatura|invoice|no|tarih|date|sayfa|page|e-?arşiv|e-?fatura|tel|vergi|vkn|tckn|mersis|epdk|\d{1,5}|tr\d|senaryo|ettn|plaka|arackimlik|sipariş|özelleştirme)$', re.I)
 
-    if not supplier:
-        supplier = find(flat,
-            r'([A-ZÇĞİÖŞÜa-zçğışöşü][^\d\n]{3,60}(?:A\.Ş|Ltd|A\.S|LTD|ELEKTRİK|ENERJİ|ŞARJ)[^\n]*)',
-        )
+        result = None
+        collect_mode = False
+        collected = []
+        url_leftover = ''
+
+        for line in all_lines:
+            if re.match(r'https?://', line):
+                collect_mode = True
+                last_seg = line.split('/')[-1].upper()
+                for known in ['OTOJET', 'TRUGO', 'ZEPLİN', 'ZEPLIN']:
+                    if known in last_seg:
+                        url_leftover = last_seg[last_seg.find(known):]
+                        break
+                continue
+            if re.search(r'erişebilirsiniz', line, re.I):
+                collect_mode = True
+                m = re.search(r'erişebilirsiniz\.(.+)', line, re.I)
+                if m and m.group(1).strip():
+                    collected = [m.group(1).strip()]
+                continue
+            if collect_mode:
+                if re.match(r'^(Vergi|Tel:|E-Posta:|Nova|Cevizli|Mh\.|No:|Kat:|Plaza|MAH\.)', line, re.I): break
+                clean = re.sub(r'(ŞİRKETİ|SİRKETİ|SIRKETI|A\.Ş\.?)([A-Za-z].+)$', r'\1', line)
+                clean = re.sub(r'(TICARET|TİCARET)(ANONIM|ANONİM)', r'\1 \2', clean)
+                collected.append(clean.strip())
+                if re.search(r'(ŞİRKETİ|SİRKETİ|SIRKETI|A\.Ş\.?)$', clean.strip()): break
+
+        if url_leftover:
+            collected = [url_leftover] + collected
+        if collected:
+            joined = ' '.join(collected)
+            joined = re.sub(r'(ENERJİ|ENERJI)(YATIRIMLARI)', r'\1 \2', joined)
+            result = re.sub(r'\s+', ' ', joined).strip()[:80]
+
+        if not result:
+            prev = ''
+            for i, line in enumerate(all_lines):
+                cl = re.sub(r'\s+', ' ', line).strip()
+                if re.match(r'^e-?[Aa]rşiv\s+[Ff]atura', cl): continue
+                if re.match(r'^(Özelleştirme|Senaryo|ETTN|Sicil|İşlem|SAYIN|Sayın|SAYINabdulkadir)', cl): continue
+                if re.search(r'erişebilirsiniz|linkinden', cl, re.I): continue
+                if len(cl) >= 4 and not skip_rx.match(cl) and not re.match(r'^\d+$', cl):
+                    if not re.match(r'^[:\-\.\s/]+$', cl):
+                        result = cl[:70]
+                        # Trugo: sonraki satır sadece "A.Ş." ise birleştir
+                        if i + 1 < len(all_lines):
+                            nxt = all_lines[i + 1].strip()
+                            if re.match(r'^A\.Ş\.?$|^A\.S\.?$', nxt):
+                                result = (result + ' ' + nxt).strip()
+                        break
+                prev = cl
+        return result or 'Belirlenemedi'
+
+    supplier = _parse_supplier(text)
+
 
     # ── Vergi No ───────────────────────────────────────────────────────────────
     supplier_tax_no = find(flat,
@@ -166,7 +201,8 @@ def parse_invoice(text):
 
     # ── Tutarlar ───────────────────────────────────────────────────────────────
     total = find_num(flat,
-        r'[Öö]denecek\s+[Tt]utar\s*[:\s]+([\d\.,]+)',
+        r'[Öö]denecek\s+[Tt]utar\s*[:\s]*([\d\.,]+)',   # normal
+        r'[Öö]denecek\s*[Tt]utar([\d\.,]+)',               # "ÖdenecekTutar519,12" bitişik (Zeplin)
         r'GENEL\s+TOPLAM\s*[:\s]+([\d\.,]+)',
         r'[Gg]enel\s+[Tt]oplam\s*[:\s]+([\d\.,]+)'
     )
