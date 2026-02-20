@@ -29,18 +29,15 @@ UNITS_RX = r'(?:KWH|kWh|ADET|Adet|SAAT|GÜN|KG|MT|LT)'
 
 def parse_items(text):
     items = []
-
     def add_item(qty, unit, unit_price, line_total, desc, kdv_rate=20):
         u = 'kWh' if unit.upper() == 'KWH' else unit
         if qty <= 0 or unit_price <= 0 or line_total <= 0: return
         if any(abs(i['total'] - line_total) < 0.01 and abs(i['quantity'] - qty) < 0.01 for i in items): return
         items.append({
             'description': desc.strip() or 'Şarj Hizmet Bedeli',
-            'quantity': round(qty, 4),
-            'unit': u,
+            'quantity': round(qty, 4), 'unit': u,
             'unitPrice': round(unit_price, 5),
-            'total': round(line_total, 2),
-            'kdvRate': kdv_rate
+            'total': round(line_total, 2), 'kdvRate': kdv_rate
         })
 
     flat = re.sub(r'[\t\n\r\xa0]', ' ', text)
@@ -67,7 +64,7 @@ def parse_items(text):
         desc = re.sub(r'\s{2,}', ' ', desc).strip()
         add_item(qty, unit, up, best, desc, int(kdv_m.group(1)) if kdv_m else 20)
 
-    # Strateji B - Otojet
+    # Strateji B - Otojet (bitişik TRY)
     if not items:
         rx_b = re.compile(rf'(\d+[,.]\d+)\s*({UNITS_RX})\s*(\d+[,.]\d+)\s*(?:TRY|TL)(\d+[,.]\d+)\s*(?:TRY|TL)', re.I)
         for m in rx_b.finditer(flat):
@@ -90,44 +87,98 @@ def parse_items(text):
     return items
 
 def parse_invoice(text):
-    def find(*patterns):
+    flat = re.sub(r'[\t\n\r\xa0]', ' ', text)
+    flat = re.sub(r' {2,}', ' ', flat)
+
+    def find(t, *patterns):
         for p in patterns:
-            m = re.search(p, text)
+            m = re.search(p, t)
             if m and m.group(1): return m.group(1).strip()
         return None
 
-    def find_num(*patterns):
-        s = find(*patterns)
+    def find_num(t, *patterns):
+        s = find(t, *patterns)
         return to_num(s) if s else 0
 
-    invoice_no = find(
-        r'[Ff]atura\s*[Nn]o\s*[:\s\t]*([A-Za-z0-9\-\/]{3,30})',
-        r'FATURA\s*NO\s*[:\s\t]*([A-Za-z0-9\-\/]+)'
+    # ── Fatura No ──────────────────────────────────────────────────────────────
+    # "Fatura No : EARSIVFATURA : SARJANLIK : CTA2026..." → 3. değer
+    # Önce spesifik prefix'li no'ları dene (CTA, OTE, KE3, ZES, TAA vb.)
+    invoice_no = find(flat,
+        r'Fatura\s+No\s*[:\s]+(?:EARSIVFATURA|EFATURA)\s*[:\s]+(?:\S+)\s*[:\s]+([A-Za-z0-9\-\/]{4,30})',
+        r'Fatura\s+No\s*[:\s]+([A-Z]{2,5}\d{6,})',  # CTA2026..., OTE2026...
+        r'([A-Z]{2,5}\d{4}\d{6,})',                   # direkt format
     )
-    raw_date = find(
-        r'[Ff]atura\s+[Tt]arihi\s*[:\s\t]*([\d]{1,2}[\/\.\-][\d]{1,2}[\/\.\-][\d]{2,4})',
+    # Hiç bulunamazsa genel pattern
+    if not invoice_no:
+        invoice_no = find(flat,
+            r'Fatura\s+No\s*[:\s]+([A-Za-z0-9\-\/]{4,30})',
+        )
+    # EARSIVFATURA veya SARJANLIK gelirse reddet
+    if invoice_no and re.match(r'^(EARSIVFATURA|SARJANLIK|EFATURA|TR\d\.\d)$', invoice_no, re.I):
+        invoice_no = None
+
+    # ── Tarih ──────────────────────────────────────────────────────────────────
+    raw_date = find(flat,
+        r'Fatura\s+Tarihi\s*[:\s]+([\d]{1,2}[\/\.\-][\d]{1,2}[\/\.\-][\d]{2,4})',
         r'([\d]{2}[\.\/][\d]{2}[\.\/][\d]{4})'
     )
-    supplier = find(
-        r'(?:Satıcı|SATICI|Firma)\s+[Üü]nvan[ıi]\s*[:\s]*(.{4,70}?)(?:\n|Vergi|VKN)',
+
+    # ── Tedarikçi ──────────────────────────────────────────────────────────────
+    # pdfminer ham metinde ilk anlamlı satır tedarikçi
+    skip_rx = re.compile(r'^(fatura|invoice|no|tarih|date|sayfa|page|e-?fatura|tel|vergi|vkn|tckn|mersis|epdk|\d{1,4}|tr\d)$', re.I)
+    supplier = None
+    # Önce satır satır dene (CTG, Dicle gibi)
+    for line in text.split('\n'):
+        cl = line.strip()
+        if len(cl) >= 4 and not skip_rx.match(cl) and not re.match(r'^\d+$', cl) and not re.match(r'^[:\-\.\s]+$', cl):
+            # Satır meta bilgi değil mi kontrol et
+            if not re.match(r'^(Özelleştirme|Senaryo|ETTN|Sicil|İşlem)', cl):
+                supplier = cl[:70]
+                break
+
+    # Satırdan bulunamazsa (Otojet gibi tek uzun satır) — firma adı pattern ile bul
+    if not supplier:
+        norm = re.sub(r'\xa0', ' ', text)
+        # ETTN/UUID ve hex kodlarını temizle ki "0EC4FOTOJET" → "OTOJET" yakalansın
+        norm_clean = re.sub(r'[0-9A-Fa-f]{8}-[0-9A-Fa-f-]{27}', ' ', norm)
+        norm_clean = re.sub(r'[0-9A-Fa-f]{4,}(?=[A-ZÇĞİÖŞÜ])', ' ', norm_clean)
+        m_sup = re.search(r'(?<![A-Za-z])([A-ZÇĞİÖŞÜ]{2,}(?:\s+[A-ZÇĞİÖŞÜa-zçğışöşü\.]+){1,6}\s*(?:SİRKETİ|SİRKETI|SIRKETI|A\.Ş|A\.S|Ltd|LTD))', norm_clean)
+        if m_sup:
+            s = re.sub(r'\s+', ' ', m_sup.group(1)).strip()
+            s = re.sub(r'([A-Z])ANONİM', r'\1 ANONİM', s)
+            s = re.sub(r'([A-Z])ANONIM', r'\1 ANONIM', s)
+            s = re.sub(r'([A-Z])SİRKETİ', r'\1 SİRKETİ', s)
+            s = re.sub(r'([A-Z])SIRKETI', r'\1 SİRKETİ', s)
+            supplier = re.sub(r'\s+', ' ', s).strip()[:80]
+
+    if not supplier:
+        supplier = find(flat,
+            r'([A-ZÇĞİÖŞÜa-zçğışöşü][^\d\n]{3,60}(?:A\.Ş|Ltd|A\.S|LTD|ELEKTRİK|ENERJİ|ŞARJ)[^\n]*)',
+        )
+
+    # ── Vergi No ───────────────────────────────────────────────────────────────
+    supplier_tax_no = find(flat,
+        r'V\.K\.N\.\s*[:\s]+([\d]{10,11})',
+        r'VKN\s*[:\s]+([\d]{10,11})',
+        r'Vergi\s+Numarası\s*[:\s]+([\d]{10,11})',
+        r'Vergi\s+Kimlik\s+No\s*[:\s]+([\d]{10,11})',
     )
-    supplier_tax_no = find(
-        r'[Vv](?:ergi\s+[Kk]imlik\s+[Nn]o|KN)\s*[:\s\t]*([\d]{10,11})',
-        r'VKN\s*[:\s\t]*([\d]{10,11})'
+
+    # ── Tutarlar ───────────────────────────────────────────────────────────────
+    total = find_num(flat,
+        r'[Öö]denecek\s+[Tt]utar\s*[:\s]+([\d\.,]+)',
+        r'GENEL\s+TOPLAM\s*[:\s]+([\d\.,]+)',
+        r'[Gg]enel\s+[Tt]oplam\s*[:\s]+([\d\.,]+)'
     )
-    total = find_num(
-        r'[Öö]denecek\s+[Tt]utar\s*[:\s\t]*([\d\.,]+)',
-        r'GENEL\s+TOPLAM\s*[:\s\t]*([\d\.,]+)',
-        r'[Gg]enel\s+[Tt]oplam\s*[:\s\t]*([\d\.,]+)'
+    kdv = find_num(flat,
+        r'Hesaplanan\s+KDV\s*\([^)]+\)\s*[:\s]+([\d\.,]+)',
+        r'KDV\s+[Tt]utar[ıi]\s*[:\s]+([\d\.,]+)',
+        r'Katma\s+Değer\s+Vergisi\s*%\d+\s*[:\s]+([\d\.,]+)',
     )
-    kdv = find_num(
-        r'Hesaplanan\s+KDV\s*\([^)]+\)\s*[:\s\t]*([\d\.,]+)',
-        r'KDV\s+[Tt]utar[ıi]\s*[:\s\t]*([\d\.,]+)'
-    )
-    subtotal = find_num(
-        r'[Mm]atrah\s*[:\s\t]*([\d\.,]+)',
-        r'[Vv]ergi\s+[Mm]atrahı\s*[:\s\t]*([\d\.,]+)',
-        r'KDV\s+Matrahı\s*[:\s\t]*([\d\.,]+)'
+    subtotal = find_num(flat,
+        r'[Mm]atrah\s*[:\s]+([\d\.,]+)',
+        r'[Vv]ergi\s+[Mm]atrahı\s*[:\s]+([\d\.,]+)',
+        r'KDV\s+Matrahı\s*[:\s]+([\d\.,]+)'
     ) or round(total / 1.2, 2)
 
     items = parse_items(text)
@@ -146,7 +197,6 @@ def parse_invoice(text):
     }
 
 def download_telegram_file(file_path):
-    """Telegram'dan bot token ile dosya indir"""
     url = f'https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}'
     r = requests.get(url, timeout=30)
     r.raise_for_status()
@@ -163,39 +213,30 @@ def parse():
 
     if request.is_json:
         data = request.get_json()
-
         if 'pdf_base64' in data:
             pdf_bytes = base64.b64decode(data['pdf_base64'])
             file_name = data.get('file_name', 'fatura.pdf')
-
         elif 'file_path' in data:
-            # Telegram file_path direkt geldi
             try:
                 pdf_bytes = download_telegram_file(data['file_path'])
                 file_name = data.get('file_name', 'fatura.pdf')
             except Exception as e:
                 return jsonify({'error': f'Telegram indirme hatası: {str(e)}'}), 400
-
         elif 'pdf_url' in data:
-            # URL'den file_path çıkar ve bot token ile indir
             url = data['pdf_url']
             file_name = data.get('file_name', 'fatura.pdf')
-            # file_path'i URL'den çıkar: /file/botTOKEN/file_path
             fp_match = re.search(r'/file/bot[^/]+/(.+)', url)
             if fp_match:
-                file_path = fp_match.group(1)
                 try:
-                    pdf_bytes = download_telegram_file(file_path)
+                    pdf_bytes = download_telegram_file(fp_match.group(1))
                 except Exception as e:
                     return jsonify({'error': f'Telegram indirme hatası: {str(e)}'}), 400
             else:
-                # Direkt URL dene
                 try:
                     r = requests.get(url, timeout=30)
                     pdf_bytes = r.content
                 except Exception as e:
                     return jsonify({'error': f'URL indirme hatası: {str(e)}'}), 400
-
     elif 'file' in request.files:
         f = request.files['file']
         pdf_bytes = f.read()
@@ -204,11 +245,9 @@ def parse():
     if not pdf_bytes:
         return jsonify({'error': 'PDF bulunamadı'}), 400
 
-    # PDF kontrolü
     if pdf_bytes[:4] != b'%PDF':
-        return jsonify({'error': f'Geçersiz PDF formatı. İlk 4 byte: {pdf_bytes[:4]}'}), 400
+        return jsonify({'error': f'Geçersiz PDF. İlk bytes: {pdf_bytes[:20]}'}), 400
 
-    # PDF → metin
     try:
         text = pdfminer.extract_text(io.BytesIO(pdf_bytes))
     except Exception as e:
@@ -219,7 +258,6 @@ def parse():
 
     inv = parse_invoice(text)
     inv['fileName'] = file_name
-    inv['notes'] = ''
 
     inv_id = str(uuid.uuid4())
     row = {
